@@ -5,7 +5,7 @@
  * Multiple questions: tab bar navigation between questions
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
 	Editor,
 	type EditorTheme,
@@ -71,6 +71,45 @@ const QuestionnaireParams = Type.Object({
 	questions: Type.Array(QuestionSchema, { description: "Questions to ask the user" }),
 });
 
+// Label of the pseudo-option that opens free-form input. Must not collide with a real option label.
+const OTHER_LABEL = "Type something…";
+
+/**
+ * Dialog fallback for RPC mode (e.g. T3 Code): pi's extension-UI bridge maps
+ * select/input dialogs to the host's structured question UI. Questions run
+ * sequentially; dismissing any dialog cancels the whole questionnaire.
+ */
+async function askViaDialogs(
+	ui: Pick<ExtensionUIContext, "select" | "input">,
+	questions: Question[],
+): Promise<QuestionnaireResult> {
+	const answers: Answer[] = [];
+	for (const q of questions) {
+		const labels = q.options.map((o) => o.label);
+		if (q.allowOther) labels.push(OTHER_LABEL);
+		const choice = await ui.select(q.prompt, labels);
+		if (choice === undefined || !labels.includes(choice)) {
+			return { questions, answers, cancelled: true };
+		}
+		if (choice === OTHER_LABEL) {
+			const text = await ui.input(q.prompt, "Your answer");
+			if (text === undefined) return { questions, answers, cancelled: true };
+			const label = text.trim() || "(no response)";
+			answers.push({ id: q.id, value: label, label, wasCustom: true });
+			continue;
+		}
+		const index = labels.indexOf(choice) + 1;
+		answers.push({
+			id: q.id,
+			value: q.options[index - 1]?.value ?? choice,
+			label: choice,
+			wasCustom: false,
+			index,
+		});
+	}
+	return { questions, answers, cancelled: false };
+}
+
 function errorResult(
 	message: string,
 	questions: Question[] = [],
@@ -90,7 +129,7 @@ export default function questionnaire(pi: ExtensionAPI) {
 		parameters: QuestionnaireParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (ctx.mode !== "tui") {
+			if (!ctx.hasUI) {
 				return errorResult("Error: UI not available (running in non-interactive mode)");
 			}
 			if (params.questions.length === 0) {
@@ -107,7 +146,9 @@ export default function questionnaire(pi: ExtensionAPI) {
 			const isMulti = questions.length > 1;
 			const totalTabs = questions.length + 1; // questions + Submit
 
-			const result = await ctx.ui.custom<QuestionnaireResult>((tui, theme, _kb, done) => {
+			const result =
+				ctx.mode === "tui"
+					? await ctx.ui.custom<QuestionnaireResult>((tui, theme, _kb, done) => {
 				// State
 				let currentTab = 0;
 				let optionIndex = 0;
@@ -391,7 +432,8 @@ export default function questionnaire(pi: ExtensionAPI) {
 					},
 					handleInput,
 				};
-			});
+			})
+		: await askViaDialogs(ctx.ui, questions);
 
 			if (result.cancelled) {
 				return {
